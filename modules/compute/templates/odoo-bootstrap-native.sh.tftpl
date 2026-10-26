@@ -1,0 +1,540 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly MARKER="/var/lib/odoo-bootstrap.done"
+readonly DATA_ROOT="/srv/odoo"
+readonly SECRET_DIR="$DATA_ROOT/secrets"
+readonly BACKUP_ROOT="$DATA_ROOT/backups"
+readonly ODOO_VERSION="${odoo_version}"
+readonly ODOO_PACKAGE_URL="${odoo_package_url}"
+readonly ODOO_PACKAGE_SHA256="${odoo_package_sha256}"
+readonly ODOO_PACKAGE="/tmp/odoo.deb"
+readonly TIMEZONE="${timezone}"
+
+if [[ -f "$MARKER" ]]; then
+  exit 0
+fi
+
+# Wait for the separately managed ECS data volume, format it once, and mount it
+# by UUID so PostgreSQL and the filestore survive operating-system restarts.
+ROOT_SOURCE="$(findmnt -n -o SOURCE /)"
+ROOT_DISK="/dev/$(lsblk -no PKNAME "$ROOT_SOURCE" 2>/dev/null || true)"
+if [[ "$ROOT_DISK" == "/dev/" ]]; then
+  ROOT_DISK="$ROOT_SOURCE"
+fi
+
+DATA_DEVICE=""
+for attempt in $(seq 1 60); do
+  DATA_DEVICE="$(
+    lsblk -dpno NAME,TYPE |
+      awk '$2 == "disk" {print $1}' |
+      grep -vx "$ROOT_DISK" |
+      head -1 || true
+  )"
+  if [[ -n "$DATA_DEVICE" ]]; then
+    break
+  fi
+  sleep 5
+done
+
+if [[ -z "$DATA_DEVICE" ]]; then
+  echo "Unable to locate the Odoo data volume" >&2
+  exit 1
+fi
+
+if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+  mkfs.ext4 -F -L odoo-data "$DATA_DEVICE"
+fi
+
+DATA_UUID="$(blkid -s UUID -o value "$DATA_DEVICE")"
+install -d -m 0755 "$DATA_ROOT"
+if ! grep -q "UUID=$DATA_UUID " /etc/fstab; then
+  printf 'UUID=%s %s ext4 defaults,nofail 0 2\n' "$DATA_UUID" "$DATA_ROOT" >>/etc/fstab
+fi
+mount "$DATA_ROOT" 2>/dev/null || mount -a
+if ! mountpoint --quiet "$DATA_ROOT"; then
+  echo "Odoo data volume is not mounted at $DATA_ROOT" >&2
+  exit 1
+fi
+
+timedatectl set-timezone "$TIMEZONE"
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt_get() {
+  local attempt
+  for attempt in $(seq 1 5); do
+    if apt-get -o Acquire::Retries=3 "$@"; then
+      return 0
+    fi
+    if [[ "$attempt" -eq 5 ]]; then
+      echo "apt-get $* failed after $attempt attempts" >&2
+      return 1
+    fi
+    sleep "$((attempt * 10))"
+  done
+}
+
+apt_get update
+apt_get install -y --no-install-recommends \
+  aria2 \
+  ca-certificates \
+  curl \
+  nginx \
+  openssl \
+  postgresql \
+  postgresql-client \
+  python3-lxml-html-clean \
+  rsync \
+  wkhtmltopdf
+
+rm -f "$ODOO_PACKAGE" "$ODOO_PACKAGE.aria2"
+trap 'rm -f "$ODOO_PACKAGE" "$ODOO_PACKAGE.aria2"' EXIT
+aria2c \
+  --allow-overwrite=true \
+  --auto-file-renaming=false \
+  --check-certificate=true \
+  --checksum="sha-256=$ODOO_PACKAGE_SHA256" \
+  --connect-timeout=15 \
+  --continue=true \
+  --dir=/tmp \
+  --file-allocation=none \
+  --max-connection-per-server=16 \
+  --max-tries=10 \
+  --min-split-size=1M \
+  --out="$(basename "$ODOO_PACKAGE")" \
+  --retry-wait=5 \
+  --split=16 \
+  --timeout=30 \
+  "$ODOO_PACKAGE_URL"
+printf '%s  %s\n' "$ODOO_PACKAGE_SHA256" "$ODOO_PACKAGE" |
+  sha256sum --check --strict
+
+# APT resolves the pinned DEB's Python dependencies from the Ubuntu mirrors.
+apt_get install -y --no-install-recommends "$ODOO_PACKAGE"
+rm -f "$ODOO_PACKAGE" "$ODOO_PACKAGE.aria2"
+trap - EXIT
+
+ODOO_SERVER_VERSION="$(/usr/bin/odoo --version)"
+if [[ "$ODOO_SERVER_VERSION" != *"$ODOO_VERSION"* ]]; then
+  echo "Installed Odoo version does not match requested release: $ODOO_SERVER_VERSION" >&2
+  exit 1
+fi
+
+for command in aria2c createdb createuser curl nginx openssl pg_conftool \
+  pg_createcluster pg_ctlcluster pg_isready pg_lsclusters psql rsync runuser; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Required command is missing after package installation: $command" >&2
+    exit 1
+  fi
+done
+if ! dpkg-query --show \
+  aria2 \
+  nginx \
+  odoo \
+  postgresql \
+  python3-lxml-html-clean >/dev/null 2>&1; then
+  echo "APT did not install all required packages" >&2
+  exit 1
+fi
+
+systemctl stop odoo.service 2>/dev/null || true
+systemctl stop postgresql.service 2>/dev/null || true
+
+PG_VERSION="$(
+  find /usr/lib/postgresql -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
+    sort -V |
+    tail -1
+)"
+if [[ -z "$PG_VERSION" || ! -x "/usr/lib/postgresql/$PG_VERSION/bin/initdb" ]]; then
+  echo "Unable to locate the PostgreSQL server installed by APT" >&2
+  exit 1
+fi
+
+readonly PG_VERSION
+readonly PG_CLUSTER="main"
+readonly PG_SERVICE="postgresql@$PG_VERSION-$PG_CLUSTER.service"
+readonly DEFAULT_PGDATA="/var/lib/postgresql/$PG_VERSION/$PG_CLUSTER"
+readonly PGDATA="$DATA_ROOT/postgresql"
+
+if ! pg_lsclusters --no-header 2>/dev/null |
+  awk -v version="$PG_VERSION" '$1 == version && $2 == "main" {found = 1} END {exit !found}'; then
+  pg_createcluster "$PG_VERSION" "$PG_CLUSTER"
+fi
+systemctl stop postgresql.service 2>/dev/null || true
+systemctl stop "$PG_SERVICE" 2>/dev/null || true
+
+for attempt in $(seq 1 30); do
+  if ! pg_ctlcluster "$PG_VERSION" "$PG_CLUSTER" status >/dev/null 2>&1; then
+    break
+  fi
+  if [[ "$attempt" -eq 30 ]]; then
+    echo "PostgreSQL cluster did not stop in time" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+install -d -m 0700 "$PGDATA"
+if [[ -n "$(find "$PGDATA" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  if [[ ! -s "$PGDATA/PG_VERSION" ]]; then
+    echo "Existing PostgreSQL directory has no PG_VERSION file" >&2
+    exit 1
+  fi
+  DATA_PG_VERSION="$(tr -d '[:space:]' <"$PGDATA/PG_VERSION")"
+  if [[ "$DATA_PG_VERSION" != "$PG_VERSION" ]]; then
+    echo "PostgreSQL data major version $DATA_PG_VERSION does not match installed version $PG_VERSION" >&2
+    exit 1
+  fi
+else
+  rsync -aHAX --exclude=postmaster.pid "$DEFAULT_PGDATA/" "$PGDATA/"
+fi
+chown -R postgres:postgres "$PGDATA"
+chmod 0700 "$PGDATA"
+
+pg_conftool "$PG_VERSION" "$PG_CLUSTER" set data_directory "$PGDATA"
+pg_conftool "$PG_VERSION" "$PG_CLUSTER" set listen_addresses ""
+pg_conftool "$PG_VERSION" "$PG_CLUSTER" set password_encryption "scram-sha-256"
+
+cat >"/etc/postgresql/$PG_VERSION/$PG_CLUSTER/pg_hba.conf" <<'PG_HBA'
+local   all             postgres                                peer
+local   all             all                                     peer
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+PG_HBA
+
+install -d -m 0755 /etc/systemd/system/postgresql.service.d
+cat >/etc/systemd/system/postgresql.service.d/odoo-data.conf <<POSTGRES_UNIT
+[Unit]
+RequiresMountsFor=$DATA_ROOT
+POSTGRES_UNIT
+
+systemctl daemon-reload
+systemctl enable postgresql.service
+systemctl start "$PG_SERVICE"
+
+for attempt in $(seq 1 60); do
+  if pg_isready --quiet; then
+    break
+  fi
+  if [[ "$attempt" -eq 60 ]]; then
+    echo "PostgreSQL did not become ready in time" >&2
+    exit 1
+  fi
+  sleep 2
+done
+
+if ! runuser -u postgres -- psql --dbname=postgres --tuples-only --no-align \
+  --command "SELECT 1 FROM pg_roles WHERE rolname = 'odoo'" |
+  grep -qx 1; then
+  runuser -u postgres -- createuser \
+    --createdb \
+    --no-createrole \
+    --no-superuser \
+    odoo
+fi
+
+if ! runuser -u postgres -- psql --dbname=postgres --tuples-only --no-align \
+  --command "SELECT 1 FROM pg_database WHERE datname = 'odoo'" |
+  grep -qx 1; then
+  runuser -u postgres -- createdb \
+    --owner=odoo \
+    --encoding=UTF8 \
+    --template=template0 \
+    odoo
+fi
+
+install -d -o odoo -g odoo -m 0750 \
+  "$DATA_ROOT/addons" \
+  "$DATA_ROOT/filestore"
+install -d -o root -g odoo -m 0750 "$SECRET_DIR"
+install -d -o root -g root -m 0700 "$BACKUP_ROOT"
+
+generate_secret() {
+  local target="$1"
+  if [[ ! -s "$target" ]]; then
+    umask 077
+    openssl rand -hex 24 >"$target"
+  fi
+  chmod 0600 "$target"
+}
+
+generate_secret "$SECRET_DIR/odoo_master_password"
+generate_secret "$SECRET_DIR/initial_admin_password"
+
+MASTER_PASSWORD="$(cat "$SECRET_DIR/odoo_master_password")"
+install -d -o odoo -g odoo -m 0750 /var/log/odoo
+cat >/etc/odoo/odoo.conf <<ODOO_CONFIG
+[options]
+admin_passwd = $MASTER_PASSWORD
+db_host = False
+db_port = False
+db_user = odoo
+db_password = False
+db_name = odoo
+dbfilter = ^odoo$
+list_db = False
+proxy_mode = True
+data_dir = $DATA_ROOT/filestore
+addons_path = /usr/lib/python3/dist-packages/odoo/addons,$DATA_ROOT/addons
+http_interface = 127.0.0.1
+http_port = 8069
+gevent_port = 8072
+workers = 2
+max_cron_threads = 1
+limit_time_cpu = 120
+limit_time_real = 240
+logfile = /var/log/odoo/odoo-server.log
+ODOO_CONFIG
+chown root:odoo /etc/odoo/odoo.conf
+chmod 0640 /etc/odoo/odoo.conf
+
+install -d -m 0755 /etc/systemd/system/odoo.service.d
+cat >/etc/systemd/system/odoo.service.d/odoo-data.conf <<ODOO_UNIT
+[Unit]
+RequiresMountsFor=$DATA_ROOT
+Wants=postgresql.service
+After=postgresql.service network-online.target
+ODOO_UNIT
+systemctl daemon-reload
+
+DATABASE_INITIALIZED="$(
+  runuser -u postgres -- psql --dbname=odoo --tuples-only --no-align \
+    --command "SELECT to_regclass('public.ir_module_module') IS NOT NULL"
+)"
+INITIALIZED_NOW="false"
+if [[ "$DATABASE_INITIALIZED" != "t" ]]; then
+  runuser -u odoo -- /usr/bin/odoo \
+    --config=/etc/odoo/odoo.conf \
+    --database=odoo \
+    --init=base \
+    --without-demo=all \
+    --stop-after-init
+  INITIALIZED_NOW="true"
+fi
+
+ADMIN_LOGIN="$(
+  runuser -u postgres -- psql --dbname=odoo --tuples-only --no-align \
+    --command "SELECT u.login
+               FROM res_users AS u
+               JOIN ir_model_data AS d
+                 ON d.model = 'res.users' AND d.res_id = u.id
+               WHERE d.module = 'base' AND d.name = 'user_admin'"
+)"
+if [[ "$INITIALIZED_NOW" == "true" ]] ||
+  {
+    [[ ! -f "$DATA_ROOT/.admin-initialized" ]] &&
+      [[ ! -f "$DATA_ROOT/.database-initialized" ]] &&
+      [[ "$ADMIN_LOGIN" == "admin" ]]
+  }; then
+  chown root:odoo "$SECRET_DIR/initial_admin_password"
+  chmod 0640 "$SECRET_DIR/initial_admin_password"
+  cat >/run/odoo-set-admin.py <<'SET_ADMIN'
+from pathlib import Path
+
+password = Path("/srv/odoo/secrets/initial_admin_password").read_text().strip()
+admin = env.ref("base.user_admin")
+admin.write({"login": "odoo-admin", "password": password})
+env.cr.commit()
+SET_ADMIN
+  chown root:odoo /run/odoo-set-admin.py
+  chmod 0640 /run/odoo-set-admin.py
+  runuser -u odoo -- /usr/bin/odoo shell \
+    --config=/etc/odoo/odoo.conf \
+    --database=odoo \
+    --no-http \
+    </run/odoo-set-admin.py
+  rm -f /run/odoo-set-admin.py
+  chmod 0600 "$SECRET_DIR/initial_admin_password"
+  touch "$DATA_ROOT/.admin-initialized"
+fi
+
+systemctl enable odoo.service
+systemctl restart odoo.service
+
+install -d -m 0700 /etc/nginx/ssl
+if [[ ! -s /etc/nginx/ssl/odoo.crt || ! -s /etc/nginx/ssl/odoo.key ]]; then
+  openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 \
+    -keyout /etc/nginx/ssl/odoo.key \
+    -out /etc/nginx/ssl/odoo.crt \
+    -subj "/CN=odoo.local" \
+    -addext "subjectAltName=DNS:odoo.local"
+fi
+chmod 0600 /etc/nginx/ssl/odoo.key
+chmod 0644 /etc/nginx/ssl/odoo.crt
+
+cat >/etc/nginx/conf.d/odoo-upstream.conf <<'NGINX_UPSTREAM'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+upstream odoo_http {
+    server 127.0.0.1:8069;
+}
+
+upstream odoo_gevent {
+    server 127.0.0.1:8072;
+}
+NGINX_UPSTREAM
+
+cat >/etc/nginx/sites-available/odoo <<'NGINX'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location = /healthz {
+        proxy_pass http://odoo_http/web/login;
+        proxy_set_header Host $host;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    ssl_certificate /etc/nginx/ssl/odoo.crt;
+    ssl_certificate_key /etc/nginx/ssl/odoo.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 64m;
+
+    proxy_read_timeout 720s;
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 720s;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Real-IP $remote_addr;
+
+    location = /healthz {
+        proxy_pass http://odoo_http/web/login;
+    }
+
+    location /websocket {
+        proxy_pass http://odoo_gevent;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+
+    location / {
+        proxy_pass http://odoo_http;
+        proxy_redirect off;
+    }
+
+    location ~* /web/static/ {
+        proxy_cache_valid 200 60m;
+        proxy_buffering on;
+        expires 864000;
+        proxy_pass http://odoo_http;
+    }
+}
+NGINX
+
+rm -f /etc/nginx/sites-enabled/default
+ln -sfn /etc/nginx/sites-available/odoo /etc/nginx/sites-enabled/odoo
+nginx -t
+systemctl enable nginx.service
+systemctl restart nginx.service
+
+cat >/usr/local/sbin/odoo-status <<'STATUS'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for service in postgresql odoo nginx; do
+  if systemctl is-active --quiet "$service.service"; then
+    echo "$service service: active"
+  else
+    systemctl --no-pager --full status "$service.service" || true
+    echo "$service service: inactive" >&2
+    exit 1
+  fi
+done
+
+runuser -u odoo -- pg_isready --dbname=odoo --quiet
+for attempt in $(seq 1 60); do
+  if curl --fail --silent http://127.0.0.1:8069/web/login >/dev/null; then
+    echo "Odoo application check: PASS"
+    exit 0
+  fi
+  sleep 5
+done
+echo "Odoo application check: FAIL" >&2
+exit 1
+STATUS
+chmod 0755 /usr/local/sbin/odoo-status
+
+cat >/usr/local/sbin/odoo-credentials <<'CREDENTIALS'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Login: odoo-admin"
+printf 'Initial password: '
+cat /srv/odoo/secrets/initial_admin_password
+CREDENTIALS
+chmod 0700 /usr/local/sbin/odoo-credentials
+
+cat >/usr/local/sbin/odoo-backup <<'BACKUP'
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly BACKUP_ROOT="/srv/odoo/backups"
+readonly STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+readonly TARGET="$BACKUP_ROOT/$STAMP"
+
+install -d -m 0700 "$TARGET"
+systemctl stop odoo.service
+trap 'systemctl start odoo.service >/dev/null 2>&1 || true' EXIT
+runuser -u odoo -- pg_dump --dbname=odoo --format=custom >"$TARGET/database.dump"
+tar -C /srv/odoo -czf "$TARGET/filestore.tar.gz" filestore addons
+(
+  cd "$TARGET"
+  sha256sum database.dump filestore.tar.gz >SHA256SUMS
+)
+systemctl start odoo.service
+trap - EXIT
+echo "$TARGET"
+BACKUP
+chmod 0700 /usr/local/sbin/odoo-backup
+
+cat >/usr/local/sbin/odoo-restore <<'RESTORE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 1 || "$${CONFIRM_RESTORE:-}" != "YES" ]]; then
+  echo "Usage: CONFIRM_RESTORE=YES sudo -E odoo-restore /srv/odoo/backups/<timestamp>" >&2
+  exit 2
+fi
+
+readonly SOURCE="$1"
+test -f "$SOURCE/database.dump"
+test -f "$SOURCE/filestore.tar.gz"
+(
+  cd "$SOURCE"
+  sha256sum --check SHA256SUMS
+)
+
+systemctl stop odoo.service
+trap 'systemctl start odoo.service >/dev/null 2>&1 || true' EXIT
+runuser -u postgres -- dropdb --if-exists --force odoo
+runuser -u postgres -- createdb --owner=odoo --encoding=UTF8 --template=template0 odoo
+runuser -u odoo -- pg_restore \
+  --dbname=odoo \
+  --no-owner \
+  --no-privileges \
+  <"$SOURCE/database.dump"
+rm -rf /srv/odoo/filestore
+tar -C /srv/odoo -xzf "$SOURCE/filestore.tar.gz"
+chown -R odoo:odoo /srv/odoo/filestore /srv/odoo/addons
+systemctl start odoo.service
+trap - EXIT
+RESTORE
+chmod 0700 /usr/local/sbin/odoo-restore
+
+/usr/local/sbin/odoo-status
+touch "$MARKER"
